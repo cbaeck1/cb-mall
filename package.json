@@ -1,8 +1,12 @@
 {
   "name": "cb-mall",
   "private": true,
+  "license": "UNLICENSED",
   "version": "0.1.0",
-  "engines": { "node": ">=20", "pnpm": ">=9" },
+  "engines": {
+    "node": ">=20",
+    "pnpm": ">=9"
+  },
   "packageManager": "pnpm@9.15.9",
   "scripts": {
     "build": "turbo run build",

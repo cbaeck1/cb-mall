@@ -2,6 +2,7 @@
   "name": "@cb-mall/eslint-config",
   "version": "0.1.0",
   "private": true,
+  "license": "UNLICENSED",
   "type": "module",
   "main": "./base.js",
   "exports": {

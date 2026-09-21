@@ -1,6 +1,22 @@
 # cb몰
 
+[![Node](https://img.shields.io/badge/node-%3E%3D20-339933?logo=node.js&logoColor=white)](package.json)
+[![pnpm](https://img.shields.io/badge/pnpm-%3E%3D9-F69220?logo=pnpm&logoColor=white)](pnpm-workspace.yaml)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.7-3178C6?logo=typescript&logoColor=white)](tsconfig.base.json)
+[![Next.js](https://img.shields.io/badge/Next.js-15-000000?logo=next.js&logoColor=white)](apps/web)
+[![NestJS](https://img.shields.io/badge/NestJS-10-E0234E?logo=nestjs&logoColor=white)](apps/api)
+[![License: Proprietary](https://img.shields.io/badge/license-Proprietary-red.svg)](LICENSE)
+
+> 위 배지는 정적 정보용입니다 — 아직 CI 워크플로가 구성되지 않아(아래 "알려진 단순화" 참고)
+> 빌드 상태 배지는 넣지 않았습니다. `pnpm run build`/`typecheck`/`lint`/`check:arch`는 로컬에서
+> 전부 통과함을 확인했습니다.
+
 자사 제작 전자책(PDF)을 판매하는 온라인 서점. 설계 근거는 [`PRD.md`](./PRD.md)(8.1~8.75절)를 참고하세요 — 이 저장소의 모든 구현 결정에는 해당 PRD 절 번호가 코드 주석으로 달려 있습니다.
+
+## 라이선스
+
+비공개 상용 프로젝트입니다. [`LICENSE`](./LICENSE) 참고 — 사전 서면 허가 없이 복제·수정·배포할 수 없습니다.
+저작권자 표기는 GitHub 계정명(`cbaeck1`)으로 임시 기재했습니다 — 실제 사업자/법인명이 있다면 `LICENSE` 파일의 이름을 교체하세요.
 
 ## 구조
 
