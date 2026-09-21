@@ -1,0 +1,614 @@
+// cb몰 데이터 모델 (PRD.md 5절 기능 요구사항 기준)
+// DB: PostgreSQL (Supabase 관리형) — PRD 8절 참고
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  // 런타임: Supavisor 트랜잭션 모드 풀러(6543, `?pgbouncer=true`) — PRD 8.15/8.67절
+  //
+  // `?pgbouncer=true`를 떼지 말 것(8.67절 P-1). Supavisor는 `named_prepared_statements` 플래그가
+  // 켜져 있으면 트랜잭션 모드에서도 prepared statement를 지원하지만, 그건 Supabase 호스팅 고객이
+  // 켤 수 없는 서버 측 설정이다. Prisma 문서의 "PgBouncer 1.21+ 에서는 쓰지 마라"도 해당 없음
+  // (우리는 PgBouncer가 아니라 Supavisor이고, 조건인 max_prepared_statements도 제어 불가).
+  // 해제 조건: Supabase가 이 설정을 고객에게 노출할 때.
+  //
+  // `connection_limit`은 붙이지 말 것(8.67절 P-3). 인터넷 예시의 `connection_limit=1`은 서버리스
+  // (Vercel/Lambda) 전제이며, ECS 상주 프로세스에 적용하면 태스크당 커넥션 1개로 묶여 동시성이 무너진다.
+  url       = env("DATABASE_URL")
+  // 마이그레이션 전용 — PRD 8.15/8.57절 F-5 / 8.70절
+  //
+  // Prisma Migrate는 세션 단위 advisory lock(타임아웃 10초, 조정 불가)으로 동시 실행을 막는데,
+  // 트랜잭션 모드 풀러(6543)를 거치면 세션이 유지되지 않아 마이그레이션 자체가 실패한다.
+  //
+  // 여기에 넣을 값은 **Supavisor 세션 모드 풀러**(aws-0-<region>.pooler.supabase.com:5432)다(8.70절 S-1).
+  // 진짜 다이렉트 커넥션(db.<ref>.supabase.co:5432)은 Supabase에서 IPv6 전용인데 GitHub Actions
+  // 러너는 IPv6 아웃바운드가 없어 CI 마이그레이션이 ENETUNREACH로 실패한다. 세션 모드 풀러는
+  // 전 플랜에서 IPv4를 지원하고, 연결이 세션 내내 고정되므로 advisory lock이 정상 동작한다.
+  // → 정확한 규칙은 "풀러를 피하라"가 아니라 "트랜잭션 모드를 피하라"다.
+  //
+  // 이 값에 :6543이나 pgbouncer=true가 들어가면 안 된다(8.42절 환경변수 검증이 거부한다).
+  directUrl = env("DIRECT_DATABASE_URL")
+}
+
+enum Role {
+  CUSTOMER
+  ADMIN
+  SUPER_ADMIN // 8.20절: 관리자 계정 초대/비활성화/권한변경 전용 권한
+
+  @@map("role")
+}
+
+enum ProductStatus {
+  ON_SALE
+  SUSPENDED
+
+  @@map("product_status")
+}
+
+// FR-2.6: 오탈자 수정본(ERRATA)은 기존 상품 파일 교체 로그, MAJOR(전면 개정판)는 별도 신규 상품으로 등록되므로 참고 로그 목적
+enum RevisionType {
+  ERRATA
+  MAJOR
+
+  @@map("revision_type")
+}
+
+enum OrderStatus {
+  PENDING
+  PAID
+  CANCELLED
+  REFUNDED
+  // 8.71절 T-2: 자동취소(30분)된 주문에 뒤늦은 웹훅으로 결제 DONE이 확인된 경우.
+  // 토스 웹훅은 최대 3일 19시간까지 재시도되므로 30분 자동취소보다 늦게 도착할 수 있다.
+  // 자동 환불·자동 복구를 하지 않고 관리자 검토 대기 상태로 둔다(돈이 얽힌 판단이라 자동화하지 않음).
+  NEEDS_REVIEW @map("NEEDS_REVIEW")
+
+  @@map("order_status")
+}
+
+enum CouponType {
+  FIXED
+  PERCENT
+
+  @@map("coupon_type")
+}
+
+enum InquiryStatus {
+  OPEN
+  ANSWERED
+  CLOSED
+
+  @@map("inquiry_status")
+}
+
+enum PointTxType {
+  EARN
+  USE
+
+  @@map("point_tx_type")
+}
+
+// FR-1.1~1.6, 8.7절: 비밀번호는 Argon2id로 해싱, 이메일 인증 필요(email_verified_at)
+model User {
+  id              String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email           String    @unique
+  passwordHash    String    @map("password_hash") // Argon2id
+  phone           String?
+  name            String?
+  role            Role      @default(CUSTOMER)
+  pointBalance    Int       @default(0) @map("point_balance")
+  emailVerifiedAt DateTime? @map("email_verified_at") // FR-1.6
+  mfaEnabled      Boolean   @default(false) @map("mfa_enabled") // 8.19절: 관리자 필수, 일반 회원은 미사용
+  mfaSecretEnc    String?   @map("mfa_secret_enc") // TOTP secret, AWS KMS 봉투암호화 저장(단방향 해시 불가, 8.30절 로테이션 정책)
+  isActive        Boolean   @default(true) @map("is_active") // 8.20절: 관리자 퇴사 시 삭제 대신 비활성화(이력 보존)
+  deactivatedAt   DateTime? @map("deactivated_at")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  orders                  Order[]
+  entitlements            Entitlement[]
+  reviews                 Review[]
+  inquiries               Inquiry[]
+  productQnas             ProductQna[]
+  pointTransactions       PointTransaction[]
+  couponRedemptions       CouponRedemption[]
+  refreshTokens           RefreshToken[]
+  passwordResetTokens     PasswordResetToken[]
+  emailVerificationTokens EmailVerificationToken[]
+  pushSubscriptions       PushSubscription[]
+  mfaRecoveryCodes        MfaRecoveryCode[]
+  sentAdminInvitations    AdminInvitation[]   @relation("InvitedBy")
+  adminAuditLogs          AdminAuditLog[]
+
+  @@map("users")
+}
+
+// 8.16절: 웹 푸시 알림(FCM) 등록 토큰 저장 — 트리거(어떤 이벤트에 발송할지)는 추후 FR로 확정
+model PushSubscription {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  user      User     @relation(fields: [userId], references: [id])
+  fcmToken  String   @unique @map("fcm_token")
+  userAgent String?  @map("user_agent")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@map("push_subscriptions")
+}
+
+// FR-1.2, 8.7절: Refresh Token 회전(rotation) + 재사용 탐지용. 토큰 원문은 저장하지 않고 해시만 저장
+model RefreshToken {
+  id           String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId       String    @map("user_id") @db.Uuid
+  user         User      @relation(fields: [userId], references: [id])
+  tokenHash    String    @unique @map("token_hash")
+  expiresAt    DateTime  @map("expires_at")
+  revokedAt    DateTime? @map("revoked_at")
+  replacedById String?   @map("replaced_by_id") @db.Uuid // 회전 시 다음 토큰 id (재사용 탐지 추적용)
+  createdAt    DateTime  @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+// FR-1.1, 8.7절: 1회용 시간제한(30분) 비밀번호 재설정 토큰. 해시만 저장
+model PasswordResetToken {
+  id        String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  user      User      @relation(fields: [userId], references: [id])
+  tokenHash String    @unique @map("token_hash")
+  expiresAt DateTime  @map("expires_at")
+  usedAt    DateTime? @map("used_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@map("password_reset_tokens")
+}
+
+// FR-1.6, 8.7절: 가입 시 이메일 인증 링크 토큰. 해시만 저장
+model EmailVerificationToken {
+  id        String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  user      User      @relation(fields: [userId], references: [id])
+  tokenHash String    @unique @map("token_hash")
+  expiresAt DateTime  @map("expires_at")
+  usedAt    DateTime? @map("used_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@map("email_verification_tokens")
+}
+
+// 8.19절: TOTP 등록 시 발급하는 1회용 기기분실 대비 백업 코드(10개). 원문은 해시로만 저장
+model MfaRecoveryCode {
+  id        String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  user      User      @relation(fields: [userId], references: [id])
+  codeHash  String    @unique @map("code_hash")
+  usedAt    DateTime? @map("used_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@map("mfa_recovery_codes")
+}
+
+enum AdminInvitationStatus {
+  PENDING
+  ACCEPTED
+  EXPIRED
+
+  @@map("admin_invitation_status")
+}
+
+// 8.20절: 관리자 계정은 셀프 가입이 아닌 기존 관리자의 초대로만 생성
+model AdminInvitation {
+  id          String                 @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email       String
+  role        Role                   @default(ADMIN) // ADMIN 또는 SUPER_ADMIN 초대 가능
+  tokenHash   String                 @unique @map("token_hash")
+  invitedById String                 @map("invited_by_id") @db.Uuid
+  invitedBy   User                   @relation("InvitedBy", fields: [invitedById], references: [id])
+  status      AdminInvitationStatus  @default(PENDING)
+  expiresAt   DateTime               @map("expires_at")
+  acceptedAt  DateTime?              @map("accepted_at")
+  createdAt   DateTime               @default(now()) @map("created_at")
+
+  @@index([invitedById])
+  @@map("admin_invitations")
+}
+
+// 8.20절: 관리자 주요 행위(주문상태변경/환불/상품수정/쿠폰발급/회원제재/관리자계정변경 등) 감사 로그
+model AdminAuditLog {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  actorId    String   @map("actor_id") @db.Uuid
+  actor      User     @relation(fields: [actorId], references: [id])
+  action     String // 예: "order.cancel", "order.refund", "product.update", "coupon.create", "admin.invite"
+  targetType String   @map("target_type") // 예: "Order", "Product", "User"
+  targetId   String   @map("target_id")
+  summary    Json? // 변경 전/후 요약 등 부가 정보
+  ipAddress  String?  @map("ip_address")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@index([actorId])
+  @@index([targetType, targetId])
+  @@map("admin_audit_logs")
+}
+
+// FR-2.1
+model Category {
+  id        String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name      String
+  parentId  String?    @map("parent_id") @db.Uuid
+  parent    Category?  @relation("CategoryTree", fields: [parentId], references: [id])
+  children  Category[] @relation("CategoryTree")
+  products  Product[]
+  createdAt DateTime   @default(now()) @map("created_at")
+
+  @@index([parentId])
+  @@map("categories")
+}
+
+// FR-2.1~2.6
+model Product {
+  id            String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  categoryId    String        @map("category_id") @db.Uuid
+  category      Category      @relation(fields: [categoryId], references: [id])
+  title         String
+  titleChosung  String?       @map("title_chosung") // 8.27절: 초성 검색용, 제목 등록/수정 시 애플리케이션에서 계산해 저장
+  author        String?
+  description   String?
+  coverImageUrl String?       @map("cover_image_url") // 공개 버킷/경로의 직접 URL (8.10절)
+  price         Int
+  discountPrice Int?          @map("discount_price")
+  status        ProductStatus @default(ON_SALE)
+  pdfFileKey    String        @map("pdf_file_key") // 비공개 버킷의 S3 object key — 직접 노출 금지, 8.4절 presigned URL로만 접근
+  sampleFileUrl String?       @map("sample_file_url") // 공개 버킷/경로의 직접 URL (FR-2.2, 8.10절 — 서명 URL 불필요)
+  pageCount     Int?          @map("page_count")
+  fileSizeBytes BigInt?       @map("file_size_bytes")
+  createdAt     DateTime      @default(now()) @map("created_at")
+  updatedAt     DateTime      @updatedAt @map("updated_at")
+
+  orderItems OrderItem[]
+  reviews    Review[]
+  qnas       ProductQna[]
+  revisions  ProductRevision[]
+  fullText   ProductFullText?
+  textChunks ProductTextChunk[] // 8.59절 H-1: 본문검색 대상(청크 단위)
+
+  @@index([categoryId])
+  @@index([status])
+  @@map("products")
+}
+
+// FR-2.6, FR-7.2: 파일 교체(오탈자 수정본) 이력
+model ProductRevision {
+  id           String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  productId    String       @map("product_id") @db.Uuid
+  product      Product      @relation(fields: [productId], references: [id])
+  revisionType RevisionType @map("revision_type")
+  fileKey      String       @map("file_key")
+  note         String?
+  notifiedAt   DateTime?    @map("notified_at") // 기존 구매자 갱신 알림 발송 시각
+  createdAt    DateTime     @default(now()) @map("created_at")
+
+  @@index([productId])
+  @@map("product_revisions")
+}
+
+enum TextExtractionStatus {
+  PENDING
+  DONE
+  FAILED
+
+  @@map("text_extraction_status")
+}
+
+// FR-2.7, 8.31/8.32절: 원본 PDF 본문 전문검색용 추출 텍스트.
+// 주의: extractedText는 검색(스니펫 생성) 전용 — 어떤 API 응답 DTO에도 전체 값을 포함해서는 안 됨(코드 컨벤션으로 강제)
+model ProductFullText {
+  id            String                @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  productId     String                @unique @map("product_id") @db.Uuid
+  product       Product               @relation(fields: [productId], references: [id])
+  // 8.59절 H-1: 검색 대상은 이 컬럼이 아니라 ProductTextChunk다(GIN 인덱스도 그쪽에만 존재).
+  // 이 컬럼은 PDF를 다시 내려받아 파싱하지 않고도 청크를 재분할할 수 있도록 원본 추출 결과를 보관하는 용도.
+  extractedText String?               @map("extracted_text") @db.Text
+  status        TextExtractionStatus  @default(PENDING)
+  attempts      Int                   @default(0) // 8.32절: 최대 2회 자동 재시도
+  claimedAt     DateTime?             @map("claimed_at") // 8.52절: FOR UPDATE SKIP LOCKED 행 선점 시각(8.58절 G-4: 알림은 1분, PDF 추출은 10분 경과 시 재선점)
+  lastError     String?               @map("last_error")
+  extractedAt   DateTime?             @map("extracted_at")
+  createdAt     DateTime              @default(now()) @map("created_at")
+  updatedAt     DateTime              @updatedAt @map("updated_at")
+
+  @@index([status])
+  @@map("product_full_texts")
+}
+
+// FR-2.7, 8.59절 H-1: 실제 본문검색 대상 테이블.
+// ProductFullText(1권 1행)는 추출 상태 관리용으로만 남기고, 검색은 이 청크 테이블에서 수행한다.
+// 이유: 1권 1행 구조에서는 흔한 트라이그램이 거의 모든 책에 존재해 GIN이 사실상 전체 행을 후보로 돌려주고,
+//       Postgres가 1MB 이상인 extracted_text를 전부 TOAST에서 꺼내 재검사(recheck)하게 되어 순차 스캔보다 느려진다.
+// 주의: content 역시 전체 본문의 일부이므로 어떤 API 응답 DTO에도 그대로 포함해서는 안 되며,
+//       매칭 위치 ±15~20자 스니펫만 노출한다(8.31절 원칙 동일 적용).
+model ProductTextChunk {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  productId  String   @map("product_id") @db.Uuid
+  product    Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  chunkIndex Int      @map("chunk_index") // 책 내 순서(0-based)
+  pageFrom   Int?     @map("page_from") // 검색 결과에 "이 책 N쪽" 표시용
+  pageTo     Int?     @map("page_to")
+  // 8.60절: 정규화(NFC·유령문자 제거·하이픈 결합·한글간 개행 결합·공백 축약) 후 목표 1,000자(허용 ±200자,
+  // 문단>문장>공백 경계 우선)로 분할하며, 인접 청크와 50자 겹친다(경계에 걸친 검색어 실종 방지).
+  // GIN(gin_trgm_ops, fastupdate=off)과 STORAGE MAIN은 migration.sql에서 설정.
+  content    String   @db.Text
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  // 재추출 시에는 upsert가 아니라 productId 기준 전량 DELETE 후 createMany로 교체한다(8.60절 I-4).
+  @@unique([productId, chunkIndex])
+  @@index([productId])
+  @@map("product_text_chunks")
+}
+
+// FR-3.1~3.5
+model Order {
+  id             String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId         String?     @map("user_id") @db.Uuid
+  user           User?       @relation(fields: [userId], references: [id])
+  guestEmail     String?     @map("guest_email") // 비회원 구매 시 (FR-1.4)
+  guestPhone     String?     @map("guest_phone")
+  status         OrderStatus @default(PENDING)
+  totalAmount    Int         @map("total_amount")
+  discountAmount Int         @default(0) @map("discount_amount")
+  pointsUsed     Int         @default(0) @map("points_used")
+  couponId       String?     @map("coupon_id") @db.Uuid
+  coupon         Coupon?     @relation(fields: [couponId], references: [id])
+  cartHash       String?     @map("cart_hash") // 8.51절 C-1: 중복 주문 생성 방지용(PENDING 상태에 한해 user_id와 부분 유니크)
+  paymentMethod  String?     @map("payment_method") // 카드/카카오페이/네이버페이 (FR-3.3)
+  tossPaymentKey String?     @unique @map("toss_payment_key")
+  tossOrderId    String      @unique @map("toss_order_id")
+  paidAt         DateTime?   @map("paid_at")
+  createdAt      DateTime    @default(now()) @map("created_at")
+  updatedAt      DateTime    @updatedAt @map("updated_at")
+
+  items OrderItem[]
+
+  @@index([userId])
+  @@index([status])
+  @@map("orders")
+}
+
+// FR-3.4, 8.8~8.9절: PAYMENT_STATUS_CHANGED 웹훅 중복 수신 방지 (서명 헤더가 없어 재조회 검증 후 기록)
+model PaymentWebhookEvent {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tossEventId    String?  @unique @map("toss_event_id") // 토스 웹훅 페이로드의 이벤트 식별자(연동 시 정확한 필드명 재확인)
+  paymentKey     String   @map("payment_key")
+  reportedStatus String   @map("reported_status") // 웹훅 페이로드상의 상태(참고용, 신뢰하지 않음)
+  verifiedStatus String?  @map("verified_status") // 조회 API 재호출로 확인한 실제 상태
+  processedAt    DateTime? @map("processed_at")
+  receivedAt     DateTime @default(now()) @map("received_at")
+
+  @@index([paymentKey])
+  @@map("payment_webhook_events")
+}
+
+model OrderItem {
+  id                   String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderId              String   @map("order_id") @db.Uuid
+  order                Order    @relation(fields: [orderId], references: [id])
+  productId            String   @map("product_id") @db.Uuid
+  product              Product  @relation(fields: [productId], references: [id])
+  productTitleSnapshot String   @map("product_title_snapshot") // 상품명 변경 대비 스냅샷
+  priceAtPurchase      Int      @map("price_at_purchase")
+  createdAt            DateTime @default(now()) @map("created_at")
+
+  entitlement Entitlement?
+  review      Review?
+
+  @@index([orderId])
+  @@index([productId])
+  @@map("order_items")
+}
+
+// FR-4.1~4.5: 구매 엔타이틀먼트 (재다운로드 1년/최대 10회, 8.4절 이메일 링크=장기 토큰)
+model Entitlement {
+  id             String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderItemId    String    @unique @map("order_item_id") @db.Uuid
+  orderItem      OrderItem @relation(fields: [orderItemId], references: [id])
+  userId         String?   @map("user_id") @db.Uuid
+  user           User?     @relation(fields: [userId], references: [id])
+  guestEmail     String?   @map("guest_email")
+  accessToken    String    @unique @map("access_token") // 이메일 발송용 장기 토큰 (비회원 인증, FR-1.4)
+  downloadCount  Int       @default(0) @map("download_count")
+  maxDownloads   Int       @default(10) @map("max_downloads")
+  expiresAt      DateTime  @map("expires_at") // 구매일 + 1년
+  firstClickedAt DateTime? @map("first_clicked_at") // FR-3.5 환불 판정 기준
+  createdAt      DateTime  @default(now()) @map("created_at")
+
+  downloadLogs DownloadLog[]
+
+  @@index([userId])
+  @@index([guestEmail])
+  @@index([expiresAt])
+  @@map("entitlements")
+}
+
+// FR-4.5: presigned URL 발급 시점마다 1건 기록 (다운로드 횟수 카운트 근거, 8.4절)
+model DownloadLog {
+  id            String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  entitlementId String      @map("entitlement_id") @db.Uuid
+  entitlement   Entitlement @relation(fields: [entitlementId], references: [id])
+  issuedAt      DateTime    @default(now()) @map("issued_at")
+  ipAddress     String?     @map("ip_address")
+  userAgent     String?     @map("user_agent")
+  // 8.73절 V-2: true = 이 발급이 download_count를 차감했음 / false = 유효 창(5분) 안의 재사용 발급.
+  // 재사용 창의 기준점은 "마지막으로 차감된 발급"이다(슬라이딩 창으로 잡으면 5분마다 한 번씩
+  // 눌러 1회 차감으로 무기한 접근이 가능해져 10회 한도가 무의미해진다).
+  // 로그 자체는 차감 여부와 무관하게 항상 남긴다 — FR-4.5/FR-3.5는 "클릭했는가"를 보기 때문.
+  counted       Boolean     @default(true)
+
+  @@index([entitlementId])
+  @@index([entitlementId, issuedAt(sort: Desc)])
+  @@map("download_logs")
+}
+
+// 8.11절: 로그인/비밀번호 재설정 등 보안 민감 엔드포인트의 ECS 다중 태스크 공유 속도 제한 저장소
+// (NestJS ThrottlerStorage 커스텀 구현이 이 테이블을 사용)
+model RateLimitBucket {
+  key         String   @id // 예: "login:ip:1.2.3.4", "login:email:foo@bar.com"
+  count       Int      @default(0)
+  windowStart DateTime @map("window_start")
+  expiresAt   DateTime @map("expires_at")
+
+  @@index([expiresAt])
+  @@map("rate_limit_buckets")
+}
+
+enum NotificationChannel {
+  EMAIL
+  SMS
+  PUSH
+
+  @@map("notification_channel")
+}
+
+enum NotificationStatus {
+  PENDING
+  SENT
+  FAILED
+  // 8.72절 U-3: "다시 받기"로 새 토큰을 발급하면 8.7절 정책상 이전 토큰이 무효화되므로,
+  // 진행 중이던 재시도를 그대로 두면 죽은 토큰이 담긴 메일을 보내게 된다. 그 행을 이 상태로 취소한다.
+  CANCELLED
+
+  @@map("notification_status")
+}
+
+// 8.13/8.14/8.16/8.17절: 이메일·SMS·웹푸시 발송 이력 통합 (8.12절 Cron이 PENDING 건을 재시도)
+// 재시도 정책은 채널이 아니라 **템플릿별 프로파일**에서 주입한다(8.72절 U-4) — 같은 이메일이라도
+// password_reset(긴급)은 4회, order_confirmation(일반)은 5회다. SMS/푸시는 1(8.14/8.16절, 사실상 재시도 없음).
+// 8.18절: nextRetryAt 이전에는 재시도하지 않음(긴급/일반 프로파일별 지수 백오프는 애플리케이션 코드에서 계산)
+model NotificationOutbox {
+  id           String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  channel      NotificationChannel
+  recipientRef String              @map("recipient_ref") // EMAIL: 이메일 주소 / SMS: 휴대폰번호 / PUSH: user_id
+  template     String // 예: "password_reset", "order_confirmation", "download_link" — 8.18절 재시도 프로파일 매핑 키
+  payload      Json // 템플릿 렌더링에 필요한 데이터 — 8.58절 G-5: 다운로드 링크·토큰 등 민감값 저장 금지(식별자만 담고 링크는 발송 시점 생성)
+  provider     String // 예: "resend", "solapi", "fcm" — 채널 내 벤더 교체(8.13절 SES 전환 등) 이력 구분용
+  status       NotificationStatus  @default(PENDING)
+  attempts     Int                 @default(0)
+  maxAttempts  Int                 @default(1) @map("max_attempts")
+  // 8.72절 U-1: `now() + 지연`이 아니라 `createdAt + 누적 지연`(절대 시각)으로 계산한다.
+  // Cron이 1분 주기라 now() 기준이면 지연이 회차마다 누적되어 긴급 프로파일 총 14분이 17분이 된다.
+  nextRetryAt  DateTime?           @map("next_retry_at")
+  claimedAt    DateTime?           @map("claimed_at") // 8.52절: FOR UPDATE SKIP LOCKED 행 선점 시각(8.58절 G-4: 알림은 1분, PDF 추출은 10분 경과 시 재선점)
+  lastError    String?             @map("last_error")
+  sentAt       DateTime?           @map("sent_at")
+  createdAt    DateTime            @default(now()) @map("created_at")
+
+  @@index([status])
+  @@index([channel])
+  @@index([nextRetryAt])
+  @@map("notification_outbox")
+}
+
+// FR-6.1
+model Coupon {
+  id             String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  code           String     @unique
+  type           CouponType
+  value          Int
+  minOrderAmount Int        @default(0) @map("min_order_amount")
+  validFrom      DateTime   @map("valid_from")
+  validTo        DateTime   @map("valid_to")
+  usageLimit     Int?       @map("usage_limit")
+  usedCount      Int        @default(0) @map("used_count")
+  createdAt      DateTime   @default(now()) @map("created_at")
+
+  orders      Order[]
+  redemptions CouponRedemption[]
+
+  @@map("coupons")
+}
+
+model CouponRedemption {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  couponId   String   @map("coupon_id") @db.Uuid
+  coupon     Coupon   @relation(fields: [couponId], references: [id])
+  userId     String   @map("user_id") @db.Uuid
+  user       User     @relation(fields: [userId], references: [id])
+  orderId    String   @map("order_id") @db.Uuid
+  redeemedAt DateTime @default(now()) @map("redeemed_at")
+
+  @@unique([couponId, orderId])
+  @@index([userId])
+  @@map("coupon_redemptions")
+}
+
+// FR-5.1: 구매 확정(orderItem) 건당 1개 리뷰
+model Review {
+  id          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  productId   String    @map("product_id") @db.Uuid
+  product     Product   @relation(fields: [productId], references: [id])
+  userId      String    @map("user_id") @db.Uuid
+  user        User      @relation(fields: [userId], references: [id])
+  orderItemId String    @unique @map("order_item_id") @db.Uuid
+  orderItem   OrderItem @relation(fields: [orderItemId], references: [id])
+  rating      Int
+  content     String?
+  imageUrls   String[]  @map("image_urls")
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  @@index([productId])
+  @@map("reviews")
+}
+
+// FR-5.2
+model Inquiry {
+  id         String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId     String?       @map("user_id") @db.Uuid
+  user       User?         @relation(fields: [userId], references: [id])
+  guestEmail String?       @map("guest_email")
+  subject    String
+  content    String
+  status     InquiryStatus @default(OPEN)
+  answer     String?
+  answeredAt DateTime?     @map("answered_at")
+  createdAt  DateTime      @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@index([status])
+  @@map("inquiries")
+}
+
+// FR-5.3
+model ProductQna {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  productId String   @map("product_id") @db.Uuid
+  product   Product  @relation(fields: [productId], references: [id])
+  userId    String   @map("user_id") @db.Uuid
+  user      User     @relation(fields: [userId], references: [id])
+  question  String
+  answer    String?
+  isPublic  Boolean  @default(true) @map("is_public")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([productId])
+  @@map("product_qnas")
+}
+
+// FR-6.2
+model PointTransaction {
+  id           String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId       String      @map("user_id") @db.Uuid
+  user         User        @relation(fields: [userId], references: [id])
+  amount       Int
+  type         PointTxType
+  orderId      String?     @map("order_id") @db.Uuid
+  balanceAfter Int         @map("balance_after")
+  createdAt    DateTime    @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@map("point_transactions")
+}
