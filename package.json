@@ -1,0 +1,24 @@
+{
+  "name": "cb-mall",
+  "private": true,
+  "version": "0.1.0",
+  "engines": { "node": ">=20", "pnpm": ">=9" },
+  "packageManager": "pnpm@9.15.9",
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev",
+    "lint": "turbo run lint",
+    "typecheck": "turbo run typecheck",
+    "test": "turbo run test",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "check:arch": "node scripts/ci/check-architecture.mjs",
+    "db:generate": "pnpm --filter @cb-mall/api run db:generate",
+    "db:migrate:deploy": "pnpm --filter @cb-mall/api run db:migrate:deploy"
+  },
+  "devDependencies": {
+    "turbo": "^2.3.0",
+    "prettier": "^3.4.0",
+    "typescript": "^5.7.0"
+  }
+}

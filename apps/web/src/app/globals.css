@@ -1,0 +1,14 @@
+@import "tailwindcss";
+
+/* Tailwind v4: CSS 기반 테마 확장. brand 팔레트를 여기서 정의해야 bg-brand-600 등이 생성된다. */
+@theme {
+  --color-brand-50: #eff6ff;
+  --color-brand-100: #dbeafe;
+  --color-brand-500: #3b82f6;
+  --color-brand-600: #2563eb;
+  --color-brand-700: #1d4ed8;
+}
+
+body {
+  color-scheme: light;
+}

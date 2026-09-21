@@ -425,6 +425,7 @@ model Entitlement {
   maxDownloads   Int       @default(10) @map("max_downloads")
   expiresAt      DateTime  @map("expires_at") // 구매일 + 1년
   firstClickedAt DateTime? @map("first_clicked_at") // FR-3.5 환불 판정 기준
+  expiryNotifiedAt DateTime? @map("expiry_notified_at") // FR-4.6/8.75절: 만료 D-30 알림 중복 발송 방지
   createdAt      DateTime  @default(now()) @map("created_at")
 
   downloadLogs DownloadLog[]
